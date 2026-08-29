@@ -24,7 +24,7 @@ def test_crypto_roundtrip(tmp_path):
 
 
 def test_detector_clean():
-    d = ThreatDetector()
+    d = ThreatDetector(sensitivity=0.55)
     r = d.analyze(
         {
             "cpu_percent": 10,
@@ -40,12 +40,24 @@ def test_detector_clean():
 
 
 def test_detector_hot():
-    d = ThreatDetector()
+    d = ThreatDetector(sensitivity=0.4)
+    # warm baseline with normals first
+    normal = {
+        "cpu_percent": 15,
+        "mem_percent": 30,
+        "net_sent_rate": 40_000,
+        "net_recv_rate": 50_000,
+        "process_count": 100,
+        "connection_count": 30,
+        "disk_percent": 40,
+    }
+    for _ in range(10):
+        d.analyze(normal)
     r = d.analyze(
         {
             "cpu_percent": 97,
             "mem_percent": 95,
-            "net_sent_rate": 5e6,
+            "net_sent_rate": 9e6,
             "net_recv_rate": 5e6,
             "process_count": 500,
             "connection_count": 600,
@@ -86,7 +98,7 @@ def test_api_detect_auth():
             "features": {
                 "cpu_percent": 99,
                 "mem_percent": 95,
-                "net_sent_rate": 5e6,
+                "net_sent_rate": 9e6,
                 "net_recv_rate": 5e6,
                 "process_count": 500,
                 "connection_count": 500,
@@ -97,3 +109,11 @@ def test_api_detect_auth():
     )
     assert r.status_code == 200
     assert "analysis" in r.json()
+    assert "hits" in r.json()["analysis"]
+
+
+def test_api_baseline():
+    client = TestClient(app)
+    r = client.get("/api/detector/baseline")
+    assert r.status_code == 200
+    assert "features" in r.json()

@@ -8,7 +8,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +50,7 @@ _task: Optional[asyncio.Task] = None
 
 async def live_loop() -> None:
     global scans
-    logger.info("Live monitor started")
+    logger.info("Live monitor started (adaptive anomaly detector)")
     try:
         async for snap in monitor.stream():
             if not _running:
@@ -76,9 +76,21 @@ async def live_loop() -> None:
                     status="detected",
                     sealed=sealed["ciphertext"],
                 )
-                store.add_audit("threat_detected", {"id": tid, **analysis})
+                store.add_audit(
+                    "threat_detected",
+                    {
+                        "id": tid,
+                        "type": analysis["threat_type"],
+                        "confidence": analysis["confidence"],
+                        "hits": analysis.get("hits"),
+                    },
+                )
                 logger.warning(
-                    "Threat #%s %s conf=%.2f", tid, analysis["threat_type"], analysis["confidence"]
+                    "Threat #%s %s conf=%.2f hits=%s",
+                    tid,
+                    analysis["threat_type"],
+                    analysis["confidence"],
+                    analysis.get("hits"),
                 )
     except asyncio.CancelledError:
         logger.info("Live monitor cancelled")
@@ -105,7 +117,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="EAGLE-X Core",
-    description="Operational host security monitor",
+    description="Operational host security monitor with adaptive anomaly detection",
     version=VERSION,
     lifespan=lifespan,
 )
@@ -131,11 +143,16 @@ def require_token(authorization: Optional[str] = Header(default=None)):
 class DetectBody(BaseModel):
     features: dict[str, float] | list[float] = Field(...)
     indicator: Optional[str] = None
+    update_baseline: bool = True
 
 
 class HealBody(BaseModel):
     threat_type: str = "MANUAL"
     indicator: Optional[str] = None
+
+
+class SensitivityBody(BaseModel):
+    sensitivity: float = Field(..., ge=0.1, le=0.95)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -162,7 +179,11 @@ async def ready():
     report = run_checks(store=store, crypto=crypto, uptime=int(time.time() - started), scans=scans)
     critical = {"database", "crypto"}
     failed = [c for c in report["failed"] if c in critical]
-    body = {"ready": not failed, "status": "ready" if not failed else "not_ready", "failed_critical": failed}
+    body = {
+        "ready": not failed,
+        "status": "ready" if not failed else "not_ready",
+        "failed_critical": failed,
+    }
     return JSONResponse(body, status_code=200 if not failed else 503)
 
 
@@ -188,6 +209,7 @@ async def status():
         "scans": scans,
         "threats_total": store.count_threats(),
         "live_monitor": LIVE_MONITOR,
+        "detector": detector.baseline_snapshot(),
         "crypto_pub": crypto.public_key_b64()[:16] + "…",
     }
 
@@ -216,9 +238,28 @@ async def threats():
     }
 
 
+@app.get("/api/detector/baseline")
+async def detector_baseline():
+    return detector.baseline_snapshot()
+
+
+@app.post("/api/detector/sensitivity")
+async def set_sensitivity(body: SensitivityBody, _: bool = Depends(require_token)):
+    detector.sensitivity = float(body.sensitivity)
+    store.add_audit("sensitivity", {"value": detector.sensitivity})
+    return {"ok": True, "sensitivity": detector.sensitivity}
+
+
+@app.post("/api/detector/reset")
+async def reset_baseline(_: bool = Depends(require_token)):
+    detector.reset_baseline()
+    store.add_audit("baseline_reset", {})
+    return {"ok": True, "baseline": detector.baseline_snapshot()}
+
+
 @app.post("/api/detect")
 async def detect(body: DetectBody, _: bool = Depends(require_token)):
-    analysis = detector.analyze(body.features)
+    analysis = detector.analyze(body.features, update_baseline=body.update_baseline)
     sealed = crypto.seal(analysis)
     if analysis["threat_detected"]:
         store.add_threat(
