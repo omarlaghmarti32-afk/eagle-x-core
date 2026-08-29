@@ -43,10 +43,7 @@ _task: Optional[asyncio.Task] = None
 
 async def live_loop() -> None:
     global scans
-    logger.info(
-        "Live monitor started (IF=%s LOF shared buffer)",
-        detector._sklearn_available,
-    )
+    logger.info("Live monitor started (IF+LOF+DBSCAN sklearn=%s)", detector._sklearn_available)
     try:
         async for snap in monitor.stream():
             if not _running:
@@ -81,15 +78,17 @@ async def live_loop() -> None:
                         "hits": analysis.get("hits"),
                         "iforest": analysis.get("scores", {}).get("isolation_forest"),
                         "lof": analysis.get("scores", {}).get("lof"),
+                        "dbscan": analysis.get("scores", {}).get("dbscan"),
                     },
                 )
                 logger.warning(
-                    "Threat #%s %s conf=%.2f IF=%s LOF=%s",
+                    "Threat #%s %s conf=%.2f IF=%s LOF=%s DBSCAN=%s",
                     tid,
                     analysis["threat_type"],
                     analysis["confidence"],
                     analysis.get("scores", {}).get("isolation_forest", {}).get("anomaly"),
                     analysis.get("scores", {}).get("lof", {}).get("anomaly"),
+                    analysis.get("scores", {}).get("dbscan", {}).get("anomaly"),
                 )
     except asyncio.CancelledError:
         logger.info("Live monitor cancelled")
@@ -119,7 +118,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="EAGLE-X Core",
-    description="Host security monitor — EWMA + Isolation Forest + LOF",
+    description="Host security monitor — EWMA + Isolation Forest + LOF + DBSCAN",
     version=VERSION,
     lifespan=lifespan,
 )
@@ -175,6 +174,7 @@ async def health():
         "scans": scans,
         "iforest_trained": detector._iforest_trained,
         "lof_trained": detector._lof_trained,
+        "dbscan_trained": detector._dbscan_trained,
         "sklearn_available": detector._sklearn_available,
     }
 
@@ -204,6 +204,7 @@ async def health_deep():
     snap = detector.baseline_snapshot()
     report["isolation_forest"] = snap.get("isolation_forest")
     report["lof"] = snap.get("lof")
+    report["dbscan"] = snap.get("dbscan")
     code = 200 if report["status"] in ("ok", "degraded") else 503
     return JSONResponse(report, status_code=code)
 
@@ -276,6 +277,13 @@ async def train_iforest(_: bool = Depends(require_token)):
 async def train_lof(_: bool = Depends(require_token)):
     result = detector.train_lof_now()
     store.add_audit("lof_train", result)
+    return result
+
+
+@app.post("/api/detector/dbscan/train")
+async def train_dbscan(_: bool = Depends(require_token)):
+    result = detector.train_dbscan_now()
+    store.add_audit("dbscan_train", result)
     return result
 
 
