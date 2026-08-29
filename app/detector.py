@@ -1,13 +1,14 @@
-"""Deep anomaly detection with Isolation Forest ensemble.
+"""Deep anomaly detection ensemble.
 
-Layers (combined):
-  1. Hard ceilings — absolute unsafe host levels
-  2. EWMA baseline — online mean/variance, robust z-scores
-  3. Spike / rate-of-change — sudden jumps vs previous sample
-  4. Multi-signal patterns — correlated abuse signatures
-  5. Isolation Forest — unsupervised isolation score (sklearn)
+Layers:
+  1. Hard ceilings
+  2. EWMA z-scores
+  3. Spike / rate-of-change
+  4. Multi-signal patterns
+  5. Isolation Forest (sklearn)
+  6. Local Outlier Factor — LOF (sklearn, novelty mode)
 
-If scikit-learn is unavailable, layers 1–4 still operate fully.
+Shared rolling buffer trains IF + LOF. Without sklearn, layers 1–4 still run.
 """
 
 from __future__ import annotations
@@ -61,11 +62,13 @@ SPIKE_RATIO = {
 try:
     import numpy as np
     from sklearn.ensemble import IsolationForest
+    from sklearn.neighbors import LocalOutlierFactor
 
     _HAS_SKLEARN = True
 except Exception:  # pragma: no cover
     np = None  # type: ignore
     IsolationForest = None  # type: ignore
+    LocalOutlierFactor = None  # type: ignore
     _HAS_SKLEARN = False
 
 
@@ -79,35 +82,54 @@ class FeatureBaseline:
 
 @dataclass
 class ThreatDetector:
-    """Adaptive host anomaly detector + Isolation Forest."""
-
     sensitivity: float = field(
         default_factory=lambda: float(os.environ.get("EAGLE_AI_SENSITIVITY", "0.55"))
     )
     alpha: float = 0.12
     z_threshold: float = 3.0
     min_samples: int = 8
+
+    # Shared ML buffer
+    ml_min_train: int = 32
+    ml_refit_every: int = 16
+    ml_buffer_size: int = 256
+
     iforest_contamination: float = field(
         default_factory=lambda: float(os.environ.get("EAGLE_IFOREST_CONTAMINATION", "0.08"))
     )
-    iforest_min_train: int = 32
-    iforest_refit_every: int = 16
-    iforest_buffer_size: int = 256
-    iforest_weight: float = 0.35
+    iforest_weight: float = 0.28
+
+    lof_contamination: float = field(
+        default_factory=lambda: float(os.environ.get("EAGLE_LOF_CONTAMINATION", "0.08"))
+    )
+    lof_n_neighbors: int = field(
+        default_factory=lambda: int(os.environ.get("EAGLE_LOF_NEIGHBORS", "20"))
+    )
+    lof_weight: float = 0.28
+
     baselines: dict[str, FeatureBaseline] = field(default_factory=dict)
     _buffer: Deque[list[float]] = field(default_factory=lambda: deque(maxlen=256))
     _iforest: Any = field(default=None, repr=False)
+    _lof: Any = field(default=None, repr=False)
     _iforest_trained: bool = False
-    _iforest_seen: int = 0
-    _iforest_available: bool = field(default_factory=lambda: _HAS_SKLEARN)
+    _lof_trained: bool = False
+    _ml_seen: int = 0
+    _sklearn_available: bool = field(default_factory=lambda: _HAS_SKLEARN)
 
     def __post_init__(self) -> None:
         self.sensitivity = float(min(max(self.sensitivity, 0.1), 0.95))
         self.iforest_contamination = float(min(max(self.iforest_contamination, 0.01), 0.3))
-        self._buffer = deque(maxlen=self.iforest_buffer_size)
+        self.lof_contamination = float(min(max(self.lof_contamination, 0.01), 0.3))
+        self.lof_n_neighbors = max(5, int(self.lof_n_neighbors))
+        self._buffer = deque(maxlen=self.ml_buffer_size)
         for k in FEATURE_KEYS:
             if k not in self.baselines:
                 self.baselines[k] = FeatureBaseline()
+
+    # backward-compat attributes used by main/health
+    @property
+    def _iforest_available(self) -> bool:
+        return self._sklearn_available
 
     def _vector(self, feats: dict[str, float]) -> list[float]:
         return [float(feats.get(k, 0.0)) for k in FEATURE_KEYS]
@@ -186,69 +208,111 @@ class ThreatDetector:
         if features.get("disk_percent", 0) >= 90 and (sent + recv) > 1_000_000:
             patterns.append("disk_and_io_pressure")
             bonus += 0.18
-
         return min(bonus, 0.55), patterns
 
-    def _fit_iforest(self) -> bool:
-        if not self._iforest_available or len(self._buffer) < self.iforest_min_train:
-            return False
+    def _fit_ml(self) -> dict[str, bool]:
+        result = {"iforest": False, "lof": False}
+        if not self._sklearn_available or len(self._buffer) < self.ml_min_train:
+            return result
         X = np.array(list(self._buffer), dtype=float)
-        model = IsolationForest(
+
+        iforest = IsolationForest(
             n_estimators=100,
             contamination=self.iforest_contamination,
             max_samples="auto",
             random_state=42,
             n_jobs=1,
         )
-        model.fit(X)
-        self._iforest = model
+        iforest.fit(X)
+        self._iforest = iforest
         self._iforest_trained = True
-        return True
+        result["iforest"] = True
 
-    def _iforest_score(self, vec: list[float], update: bool) -> dict[str, Any]:
+        n_neighbors = min(self.lof_n_neighbors, max(5, len(self._buffer) - 1))
+        lof = LocalOutlierFactor(
+            n_neighbors=n_neighbors,
+            contamination=self.lof_contamination,
+            novelty=True,
+            n_jobs=1,
+        )
+        lof.fit(X)
+        self._lof = lof
+        self._lof_trained = True
+        result["lof"] = True
+        return result
+
+    def _score_iforest(self, vec: list[float]) -> dict[str, Any]:
         meta: dict[str, Any] = {
-            "available": self._iforest_available,
+            "available": self._sklearn_available,
             "trained": self._iforest_trained,
             "buffer_size": len(self._buffer),
             "score": None,
             "anomaly": False,
             "contribution": 0.0,
         }
-        if not self._iforest_available:
-            return meta
-
-        if update:
-            self._buffer.append(list(vec))
-            self._iforest_seen += 1
-            if (
-                not self._iforest_trained and len(self._buffer) >= self.iforest_min_train
-            ) or (
-                self._iforest_trained
-                and self._iforest_seen % self.iforest_refit_every == 0
-                and len(self._buffer) >= self.iforest_min_train
-            ):
-                self._fit_iforest()
-
         if not self._iforest_trained or self._iforest is None:
-            meta["trained"] = False
             return meta
-
         X = np.array([vec], dtype=float)
         raw = float(self._iforest.decision_function(X)[0])
         pred = int(self._iforest.predict(X)[0])
-        anomaly_strength = max(0.0, min(1.0, (0.15 - raw) / 0.5))
+        strength = max(0.0, min(1.0, (0.15 - raw) / 0.5))
         if pred == -1:
-            anomaly_strength = max(anomaly_strength, 0.55)
-
+            strength = max(strength, 0.55)
         meta.update(
             {
                 "trained": True,
                 "score": round(raw, 4),
                 "anomaly": pred == -1,
-                "contribution": round(anomaly_strength * self.iforest_weight, 3),
+                "contribution": round(strength * self.iforest_weight, 3),
             }
         )
         return meta
+
+    def _score_lof(self, vec: list[float]) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "available": self._sklearn_available,
+            "trained": self._lof_trained,
+            "buffer_size": len(self._buffer),
+            "n_neighbors": self.lof_n_neighbors,
+            "score": None,
+            "anomaly": False,
+            "contribution": 0.0,
+        }
+        if not self._lof_trained or self._lof is None:
+            return meta
+        X = np.array([vec], dtype=float)
+        # decision_function: larger = more normal; negative-ish outliers
+        raw = float(self._lof.decision_function(X)[0])
+        pred = int(self._lof.predict(X)[0])
+        # LOF decision_function often in similar range; map to strength
+        strength = max(0.0, min(1.0, (0.1 - raw) / 0.6))
+        if pred == -1:
+            strength = max(strength, 0.55)
+        meta.update(
+            {
+                "trained": True,
+                "score": round(raw, 4),
+                "anomaly": pred == -1,
+                "contribution": round(strength * self.lof_weight, 3),
+            }
+        )
+        return meta
+
+    def _maybe_update_ml(self, vec: list[float], update: bool) -> None:
+        if not self._sklearn_available or not update:
+            return
+        self._buffer.append(list(vec))
+        self._ml_seen += 1
+        need_first = not (self._iforest_trained and self._lof_trained) and len(
+            self._buffer
+        ) >= self.ml_min_train
+        need_refit = (
+            self._iforest_trained
+            and self._ml_seen % self.ml_refit_every == 0
+            and len(self._buffer) >= self.ml_min_train
+        )
+        if need_first or need_refit:
+            self._fit_ml()
 
     def _classify(
         self,
@@ -257,9 +321,9 @@ class ThreatDetector:
         z_hits: list[str],
         spikes: list[str],
         patterns: list[str],
-        iforest_anomaly: bool,
+        ml_anomaly: bool,
     ) -> tuple[str, str]:
-        if confidence < self.sensitivity and not hard and not iforest_anomaly:
+        if confidence < self.sensitivity and not hard and not ml_anomaly:
             return "NONE", "none"
 
         net_keys = {"net_sent_rate", "net_recv_rate"}
@@ -275,7 +339,9 @@ class ThreatDetector:
             t = "PROCESS_FLOOD"
         elif "disk_and_io_pressure" in patterns or "disk_percent" in signals:
             t = "STORAGE_ANOMALY"
-        elif iforest_anomaly:
+        elif "local_outlier_factor" in patterns and "isolation_forest" not in patterns:
+            t = "LOF_ANOMALY"
+        elif "isolation_forest" in patterns:
             t = "IFOREST_ANOMALY"
         else:
             t = "HOST_ANOMALY"
@@ -284,7 +350,7 @@ class ThreatDetector:
             sev = "critical"
         elif confidence >= 0.65 or hard:
             sev = "high"
-        elif confidence >= 0.45 or iforest_anomaly:
+        elif confidence >= 0.45 or ml_anomaly:
             sev = "medium"
         else:
             sev = "low"
@@ -344,12 +410,19 @@ class ThreatDetector:
         score += pattern_bonus
 
         vec = self._vector(feats)
-        if_meta = self._iforest_score(vec, update=update_baseline)
+        self._maybe_update_ml(vec, update=update_baseline)
+        if_meta = self._score_iforest(vec)
+        lof_meta = self._score_lof(vec)
         score += float(if_meta.get("contribution") or 0.0)
+        score += float(lof_meta.get("contribution") or 0.0)
+
         if if_meta.get("anomaly"):
             patterns = list(patterns) + ["isolation_forest"]
+        if lof_meta.get("anomaly"):
+            patterns = list(patterns) + ["local_outlier_factor"]
 
         confidence = min(round(score, 3), 1.0)
+        ml_anomaly = bool(if_meta.get("anomaly") or lof_meta.get("anomaly"))
         threat = (
             confidence >= self.sensitivity
             or len(hard) >= 1
@@ -361,6 +434,10 @@ class ThreatDetector:
                 if_meta.get("anomaly")
                 and float(if_meta.get("contribution") or 0) >= self.iforest_weight * 0.5
             )
+            or (
+                lof_meta.get("anomaly")
+                and float(lof_meta.get("contribution") or 0) >= self.lof_weight * 0.5
+            )
         )
 
         threat_type, severity = self._classify(
@@ -369,7 +446,7 @@ class ThreatDetector:
             z_hits,
             spike_hits,
             patterns,
-            bool(if_meta.get("anomaly")),
+            ml_anomaly,
         )
         if not threat:
             threat_type, severity = "NONE", "none"
@@ -395,6 +472,7 @@ class ThreatDetector:
                 "spike": {k: v for k, v in spike_map.items() if v > 0},
                 "pattern_bonus": round(pattern_bonus, 3),
                 "isolation_forest": if_meta,
+                "lof": lof_meta,
             },
             "baseline": {
                 "samples": samples,
@@ -403,7 +481,8 @@ class ThreatDetector:
                 "sensitivity": self.sensitivity,
                 "z_threshold": self.z_threshold,
                 "iforest_trained": self._iforest_trained,
-                "iforest_available": self._iforest_available,
+                "lof_trained": self._lof_trained,
+                "sklearn_available": self._sklearn_available,
             },
             "features": feats,
         }
@@ -423,12 +502,21 @@ class ThreatDetector:
             "z_threshold": self.z_threshold,
             "min_samples": self.min_samples,
             "isolation_forest": {
-                "available": self._iforest_available,
+                "available": self._sklearn_available,
                 "trained": self._iforest_trained,
                 "buffer_size": len(self._buffer),
-                "min_train": self.iforest_min_train,
+                "min_train": self.ml_min_train,
                 "contamination": self.iforest_contamination,
                 "weight": self.iforest_weight,
+            },
+            "lof": {
+                "available": self._sklearn_available,
+                "trained": self._lof_trained,
+                "buffer_size": len(self._buffer),
+                "min_train": self.ml_min_train,
+                "n_neighbors": self.lof_n_neighbors,
+                "contamination": self.lof_contamination,
+                "weight": self.lof_weight,
             },
         }
 
@@ -436,14 +524,36 @@ class ThreatDetector:
         self.baselines = {k: FeatureBaseline() for k in FEATURE_KEYS}
         self._buffer.clear()
         self._iforest = None
+        self._lof = None
         self._iforest_trained = False
-        self._iforest_seen = 0
+        self._lof_trained = False
+        self._ml_seen = 0
 
     def train_iforest_now(self) -> dict[str, Any]:
-        ok = self._fit_iforest()
+        fitted = self._fit_ml()
         return {
-            "ok": ok,
+            "ok": bool(fitted.get("iforest")),
             "trained": self._iforest_trained,
             "buffer_size": len(self._buffer),
-            "available": self._iforest_available,
+            "available": self._sklearn_available,
+        }
+
+    def train_lof_now(self) -> dict[str, Any]:
+        fitted = self._fit_ml()
+        return {
+            "ok": bool(fitted.get("lof")),
+            "trained": self._lof_trained,
+            "buffer_size": len(self._buffer),
+            "available": self._sklearn_available,
+            "n_neighbors": self.lof_n_neighbors,
+        }
+
+    def train_ml_now(self) -> dict[str, Any]:
+        fitted = self._fit_ml()
+        return {
+            "ok": any(fitted.values()),
+            "iforest": self._iforest_trained,
+            "lof": self._lof_trained,
+            "buffer_size": len(self._buffer),
+            "available": self._sklearn_available,
         }

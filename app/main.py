@@ -15,14 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .config import (
-    API_TOKEN,
-    LIVE_MONITOR,
-    LOG_DIR,
-    LOG_LEVEL,
-    SEAL,
-    VERSION,
-)
+from .config import API_TOKEN, LIVE_MONITOR, LOG_DIR, LOG_LEVEL, SEAL, VERSION
 from .crypto import CryptoEngine
 from .db import Store
 from .detector import ThreatDetector
@@ -51,8 +44,8 @@ _task: Optional[asyncio.Task] = None
 async def live_loop() -> None:
     global scans
     logger.info(
-        "Live monitor started (EWMA + IsolationForest available=%s)",
-        detector._iforest_available,
+        "Live monitor started (IF=%s LOF shared buffer)",
+        detector._sklearn_available,
     )
     try:
         async for snap in monitor.stream():
@@ -87,14 +80,16 @@ async def live_loop() -> None:
                         "confidence": analysis["confidence"],
                         "hits": analysis.get("hits"),
                         "iforest": analysis.get("scores", {}).get("isolation_forest"),
+                        "lof": analysis.get("scores", {}).get("lof"),
                     },
                 )
                 logger.warning(
-                    "Threat #%s %s conf=%.2f iforest=%s",
+                    "Threat #%s %s conf=%.2f IF=%s LOF=%s",
                     tid,
                     analysis["threat_type"],
                     analysis["confidence"],
                     analysis.get("scores", {}).get("isolation_forest", {}).get("anomaly"),
+                    analysis.get("scores", {}).get("lof", {}).get("anomaly"),
                 )
     except asyncio.CancelledError:
         logger.info("Live monitor cancelled")
@@ -107,11 +102,7 @@ async def lifespan(app: FastAPI):
     _running = True
     store.add_audit(
         "startup",
-        {
-            "version": VERSION,
-            "seal": SEAL,
-            "iforest": detector._iforest_available,
-        },
+        {"version": VERSION, "seal": SEAL, "sklearn": detector._sklearn_available},
     )
     if LIVE_MONITOR:
         _task = asyncio.create_task(live_loop())
@@ -128,7 +119,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="EAGLE-X Core",
-    description="Host security monitor — EWMA + Isolation Forest ensemble",
+    description="Host security monitor — EWMA + Isolation Forest + LOF",
     version=VERSION,
     lifespan=lifespan,
 )
@@ -171,7 +162,7 @@ async def dashboard():
     html = Path(__file__).parent.parent / "static" / "dashboard.html"
     if html.exists():
         return html.read_text(encoding="utf-8")
-    return f"<h1>EAGLE-X Core {VERSION}</h1><p><a href='/api/health'>/api/health</a></p>"
+    return f"<h1>EAGLE-X Core {VERSION}</h1>"
 
 
 @app.get("/api/health")
@@ -182,8 +173,9 @@ async def health():
         "seal": SEAL,
         "uptime_seconds": int(time.time() - started),
         "scans": scans,
-        "iforest_available": detector._iforest_available,
         "iforest_trained": detector._iforest_trained,
+        "lof_trained": detector._lof_trained,
+        "sklearn_available": detector._sklearn_available,
     }
 
 
@@ -209,7 +201,9 @@ async def health_deep():
         scans=scans,
         live=LIVE_MONITOR,
     )
-    report["isolation_forest"] = detector.baseline_snapshot().get("isolation_forest")
+    snap = detector.baseline_snapshot()
+    report["isolation_forest"] = snap.get("isolation_forest")
+    report["lof"] = snap.get("lof")
     code = 200 if report["status"] in ("ok", "degraded") else 503
     return JSONResponse(report, status_code=code)
 
@@ -275,6 +269,20 @@ async def reset_baseline(_: bool = Depends(require_token)):
 async def train_iforest(_: bool = Depends(require_token)):
     result = detector.train_iforest_now()
     store.add_audit("iforest_train", result)
+    return result
+
+
+@app.post("/api/detector/lof/train")
+async def train_lof(_: bool = Depends(require_token)):
+    result = detector.train_lof_now()
+    store.add_audit("lof_train", result)
+    return result
+
+
+@app.post("/api/detector/ml/train")
+async def train_ml(_: bool = Depends(require_token)):
+    result = detector.train_ml_now()
+    store.add_audit("ml_train", result)
     return result
 
 
