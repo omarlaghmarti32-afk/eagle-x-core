@@ -16,7 +16,7 @@ import math
 import os
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Optional
+from typing import Any, Deque
 
 FEATURE_KEYS = [
     "cpu_percent",
@@ -93,7 +93,7 @@ class ThreatDetector:
     iforest_min_train: int = 32
     iforest_refit_every: int = 16
     iforest_buffer_size: int = 256
-    iforest_weight: float = 0.35  # contribution of IF to ensemble score
+    iforest_weight: float = 0.35
     baselines: dict[str, FeatureBaseline] = field(default_factory=dict)
     _buffer: Deque[list[float]] = field(default_factory=lambda: deque(maxlen=256))
     _iforest: Any = field(default=None, repr=False)
@@ -189,7 +189,6 @@ class ThreatDetector:
 
         return min(bonus, 0.55), patterns
 
-    # --------------------------------------------------------- Isolation Forest
     def _fit_iforest(self) -> bool:
         if not self._iforest_available or len(self._buffer) < self.iforest_min_train:
             return False
@@ -207,7 +206,6 @@ class ThreatDetector:
         return True
 
     def _iforest_score(self, vec: list[float], update: bool) -> dict[str, Any]:
-        """Return isolation forest contribution and metadata."""
         meta: dict[str, Any] = {
             "available": self._iforest_available,
             "trained": self._iforest_trained,
@@ -236,11 +234,8 @@ class ThreatDetector:
             return meta
 
         X = np.array([vec], dtype=float)
-        # decision_function: higher = more normal; negative tends to be outlier
         raw = float(self._iforest.decision_function(X)[0])
-        pred = int(self._iforest.predict(X)[0])  # -1 anomaly, 1 normal
-        # Map raw score to [0,1] anomaly confidence (approx)
-        # Typical decision_function range roughly [-0.5, 0.5]
+        pred = int(self._iforest.predict(X)[0])
         anomaly_strength = max(0.0, min(1.0, (0.15 - raw) / 0.5))
         if pred == -1:
             anomaly_strength = max(anomaly_strength, 0.55)
@@ -317,8 +312,6 @@ class ThreatDetector:
             else:
                 b = self.baselines.get(key, FeatureBaseline())
                 std = math.sqrt(max(b.var, 1e-6))
-                z = (value - b.mean) / std if b.n >= 2 else 0.0  # noqa — bug!
-                # fix below without using undefined value
                 z = (val - b.mean) / std if b.n >= 2 else 0.0
                 spike = 0.0
                 if b.n > 0 and b.last > 0:
@@ -447,7 +440,6 @@ class ThreatDetector:
         self._iforest_seen = 0
 
     def train_iforest_now(self) -> dict[str, Any]:
-        """Force Isolation Forest fit on current buffer."""
         ok = self._fit_iforest()
         return {
             "ok": ok,
