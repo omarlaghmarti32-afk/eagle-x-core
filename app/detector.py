@@ -5,10 +5,11 @@ Layers:
   2. EWMA z-scores
   3. Spike / rate-of-change
   4. Multi-signal patterns
-  5. Isolation Forest (sklearn)
-  6. Local Outlier Factor — LOF (sklearn, novelty mode)
+  5. Isolation Forest
+  6. Local Outlier Factor (LOF)
+  7. DBSCAN density clustering — points far from clusters = anomaly
 
-Shared rolling buffer trains IF + LOF. Without sklearn, layers 1–4 still run.
+Shared rolling buffer. Without sklearn, layers 1–4 still run.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import math
 import os
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque
+from typing import Any, Deque, Optional
 
 FEATURE_KEYS = [
     "cpu_percent",
@@ -61,14 +62,18 @@ SPIKE_RATIO = {
 
 try:
     import numpy as np
+    from sklearn.cluster import DBSCAN
     from sklearn.ensemble import IsolationForest
     from sklearn.neighbors import LocalOutlierFactor
+    from sklearn.preprocessing import StandardScaler
 
     _HAS_SKLEARN = True
 except Exception:  # pragma: no cover
     np = None  # type: ignore
+    DBSCAN = None  # type: ignore
     IsolationForest = None  # type: ignore
     LocalOutlierFactor = None  # type: ignore
+    StandardScaler = None  # type: ignore
     _HAS_SKLEARN = False
 
 
@@ -89,7 +94,6 @@ class ThreatDetector:
     z_threshold: float = 3.0
     min_samples: int = 8
 
-    # Shared ML buffer
     ml_min_train: int = 32
     ml_refit_every: int = 16
     ml_buffer_size: int = 256
@@ -97,7 +101,7 @@ class ThreatDetector:
     iforest_contamination: float = field(
         default_factory=lambda: float(os.environ.get("EAGLE_IFOREST_CONTAMINATION", "0.08"))
     )
-    iforest_weight: float = 0.28
+    iforest_weight: float = 0.22
 
     lof_contamination: float = field(
         default_factory=lambda: float(os.environ.get("EAGLE_LOF_CONTAMINATION", "0.08"))
@@ -105,14 +109,28 @@ class ThreatDetector:
     lof_n_neighbors: int = field(
         default_factory=lambda: int(os.environ.get("EAGLE_LOF_NEIGHBORS", "20"))
     )
-    lof_weight: float = 0.28
+    lof_weight: float = 0.22
+
+    dbscan_eps: float = field(
+        default_factory=lambda: float(os.environ.get("EAGLE_DBSCAN_EPS", "1.2"))
+    )
+    dbscan_min_samples: int = field(
+        default_factory=lambda: int(os.environ.get("EAGLE_DBSCAN_MIN_SAMPLES", "5"))
+    )
+    dbscan_weight: float = 0.22
 
     baselines: dict[str, FeatureBaseline] = field(default_factory=dict)
     _buffer: Deque[list[float]] = field(default_factory=lambda: deque(maxlen=256))
     _iforest: Any = field(default=None, repr=False)
     _lof: Any = field(default=None, repr=False)
+    _dbscan_scaler: Any = field(default=None, repr=False)
+    _dbscan_core: Any = field(default=None, repr=False)  # scaled core points
+    _dbscan_labels: Any = field(default=None, repr=False)
+    _dbscan_n_clusters: int = 0
+    _dbscan_n_noise: int = 0
     _iforest_trained: bool = False
     _lof_trained: bool = False
+    _dbscan_trained: bool = False
     _ml_seen: int = 0
     _sklearn_available: bool = field(default_factory=lambda: _HAS_SKLEARN)
 
@@ -121,12 +139,13 @@ class ThreatDetector:
         self.iforest_contamination = float(min(max(self.iforest_contamination, 0.01), 0.3))
         self.lof_contamination = float(min(max(self.lof_contamination, 0.01), 0.3))
         self.lof_n_neighbors = max(5, int(self.lof_n_neighbors))
+        self.dbscan_eps = float(max(self.dbscan_eps, 0.1))
+        self.dbscan_min_samples = max(2, int(self.dbscan_min_samples))
         self._buffer = deque(maxlen=self.ml_buffer_size)
         for k in FEATURE_KEYS:
             if k not in self.baselines:
                 self.baselines[k] = FeatureBaseline()
 
-    # backward-compat attributes used by main/health
     @property
     def _iforest_available(self) -> bool:
         return self._sklearn_available
@@ -211,7 +230,7 @@ class ThreatDetector:
         return min(bonus, 0.55), patterns
 
     def _fit_ml(self) -> dict[str, bool]:
-        result = {"iforest": False, "lof": False}
+        result = {"iforest": False, "lof": False, "dbscan": False}
         if not self._sklearn_available or len(self._buffer) < self.ml_min_train:
             return result
         X = np.array(list(self._buffer), dtype=float)
@@ -239,6 +258,31 @@ class ThreatDetector:
         self._lof = lof
         self._lof_trained = True
         result["lof"] = True
+
+        # DBSCAN on standardized features (rates vs percents differ in scale)
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        clustering = DBSCAN(
+            eps=self.dbscan_eps,
+            min_samples=min(self.dbscan_min_samples, max(2, len(self._buffer) // 8)),
+            n_jobs=1,
+        )
+        labels = clustering.fit_predict(Xs)
+        core_mask = labels != -1
+        self._dbscan_scaler = scaler
+        self._dbscan_labels = labels
+        self._dbscan_n_clusters = int(len(set(labels)) - (1 if -1 in labels else 0))
+        self._dbscan_n_noise = int(np.sum(labels == -1))
+        if np.any(core_mask):
+            self._dbscan_core = Xs[core_mask]
+            self._dbscan_trained = True
+            result["dbscan"] = True
+        else:
+            # all noise — still mark trained but core empty → everything anomalous-ish
+            self._dbscan_core = Xs
+            self._dbscan_trained = True
+            result["dbscan"] = True
+
         return result
 
     def _score_iforest(self, vec: list[float]) -> dict[str, Any]:
@@ -281,10 +325,8 @@ class ThreatDetector:
         if not self._lof_trained or self._lof is None:
             return meta
         X = np.array([vec], dtype=float)
-        # decision_function: larger = more normal; negative-ish outliers
         raw = float(self._lof.decision_function(X)[0])
         pred = int(self._lof.predict(X)[0])
-        # LOF decision_function often in similar range; map to strength
         strength = max(0.0, min(1.0, (0.1 - raw) / 0.6))
         if pred == -1:
             strength = max(strength, 0.55)
@@ -298,19 +340,59 @@ class ThreatDetector:
         )
         return meta
 
+    def _score_dbscan(self, vec: list[float]) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "available": self._sklearn_available,
+            "trained": self._dbscan_trained,
+            "buffer_size": len(self._buffer),
+            "eps": self.dbscan_eps,
+            "min_samples": self.dbscan_min_samples,
+            "n_clusters": self._dbscan_n_clusters,
+            "n_noise_in_fit": self._dbscan_n_noise,
+            "distance": None,
+            "anomaly": False,
+            "contribution": 0.0,
+        }
+        if (
+            not self._dbscan_trained
+            or self._dbscan_scaler is None
+            or self._dbscan_core is None
+            or len(self._dbscan_core) == 0
+        ):
+            return meta
+
+        X = np.array([vec], dtype=float)
+        Xs = self._dbscan_scaler.transform(X)
+        # min Euclidean distance to any in-cluster (core) point
+        diffs = self._dbscan_core - Xs[0]
+        dists = np.sqrt(np.sum(diffs * diffs, axis=1))
+        min_dist = float(np.min(dists))
+        # beyond eps → noise / anomaly; strength grows with distance
+        anomaly = min_dist > self.dbscan_eps
+        strength = max(0.0, min(1.0, (min_dist - self.dbscan_eps * 0.5) / max(self.dbscan_eps, 1e-6)))
+        if anomaly:
+            strength = max(strength, 0.5)
+
+        meta.update(
+            {
+                "trained": True,
+                "distance": round(min_dist, 4),
+                "anomaly": anomaly,
+                "contribution": round(strength * self.dbscan_weight, 3),
+            }
+        )
+        return meta
+
     def _maybe_update_ml(self, vec: list[float], update: bool) -> None:
         if not self._sklearn_available or not update:
             return
         self._buffer.append(list(vec))
         self._ml_seen += 1
-        need_first = not (self._iforest_trained and self._lof_trained) and len(
-            self._buffer
-        ) >= self.ml_min_train
-        need_refit = (
-            self._iforest_trained
-            and self._ml_seen % self.ml_refit_every == 0
-            and len(self._buffer) >= self.ml_min_train
+        ready = len(self._buffer) >= self.ml_min_train
+        need_first = (
+            not (self._iforest_trained and self._lof_trained and self._dbscan_trained) and ready
         )
+        need_refit = self._iforest_trained and self._ml_seen % self.ml_refit_every == 0 and ready
         if need_first or need_refit:
             self._fit_ml()
 
@@ -339,6 +421,8 @@ class ThreatDetector:
             t = "PROCESS_FLOOD"
         elif "disk_and_io_pressure" in patterns or "disk_percent" in signals:
             t = "STORAGE_ANOMALY"
+        elif "dbscan_noise" in patterns and "isolation_forest" not in patterns and "local_outlier_factor" not in patterns:
+            t = "DBSCAN_ANOMALY"
         elif "local_outlier_factor" in patterns and "isolation_forest" not in patterns:
             t = "LOF_ANOMALY"
         elif "isolation_forest" in patterns:
@@ -413,16 +497,22 @@ class ThreatDetector:
         self._maybe_update_ml(vec, update=update_baseline)
         if_meta = self._score_iforest(vec)
         lof_meta = self._score_lof(vec)
+        db_meta = self._score_dbscan(vec)
         score += float(if_meta.get("contribution") or 0.0)
         score += float(lof_meta.get("contribution") or 0.0)
+        score += float(db_meta.get("contribution") or 0.0)
 
         if if_meta.get("anomaly"):
             patterns = list(patterns) + ["isolation_forest"]
         if lof_meta.get("anomaly"):
             patterns = list(patterns) + ["local_outlier_factor"]
+        if db_meta.get("anomaly"):
+            patterns = list(patterns) + ["dbscan_noise"]
 
         confidence = min(round(score, 3), 1.0)
-        ml_anomaly = bool(if_meta.get("anomaly") or lof_meta.get("anomaly"))
+        ml_anomaly = bool(
+            if_meta.get("anomaly") or lof_meta.get("anomaly") or db_meta.get("anomaly")
+        )
         threat = (
             confidence >= self.sensitivity
             or len(hard) >= 1
@@ -437,6 +527,10 @@ class ThreatDetector:
             or (
                 lof_meta.get("anomaly")
                 and float(lof_meta.get("contribution") or 0) >= self.lof_weight * 0.5
+            )
+            or (
+                db_meta.get("anomaly")
+                and float(db_meta.get("contribution") or 0) >= self.dbscan_weight * 0.5
             )
         )
 
@@ -473,6 +567,7 @@ class ThreatDetector:
                 "pattern_bonus": round(pattern_bonus, 3),
                 "isolation_forest": if_meta,
                 "lof": lof_meta,
+                "dbscan": db_meta,
             },
             "baseline": {
                 "samples": samples,
@@ -482,6 +577,7 @@ class ThreatDetector:
                 "z_threshold": self.z_threshold,
                 "iforest_trained": self._iforest_trained,
                 "lof_trained": self._lof_trained,
+                "dbscan_trained": self._dbscan_trained,
                 "sklearn_available": self._sklearn_available,
             },
             "features": feats,
@@ -518,6 +614,17 @@ class ThreatDetector:
                 "contamination": self.lof_contamination,
                 "weight": self.lof_weight,
             },
+            "dbscan": {
+                "available": self._sklearn_available,
+                "trained": self._dbscan_trained,
+                "buffer_size": len(self._buffer),
+                "min_train": self.ml_min_train,
+                "eps": self.dbscan_eps,
+                "min_samples": self.dbscan_min_samples,
+                "n_clusters": self._dbscan_n_clusters,
+                "n_noise_in_fit": self._dbscan_n_noise,
+                "weight": self.dbscan_weight,
+            },
         }
 
     def reset_baseline(self) -> None:
@@ -525,8 +632,14 @@ class ThreatDetector:
         self._buffer.clear()
         self._iforest = None
         self._lof = None
+        self._dbscan_scaler = None
+        self._dbscan_core = None
+        self._dbscan_labels = None
+        self._dbscan_n_clusters = 0
+        self._dbscan_n_noise = 0
         self._iforest_trained = False
         self._lof_trained = False
+        self._dbscan_trained = False
         self._ml_seen = 0
 
     def train_iforest_now(self) -> dict[str, Any]:
@@ -548,12 +661,26 @@ class ThreatDetector:
             "n_neighbors": self.lof_n_neighbors,
         }
 
+    def train_dbscan_now(self) -> dict[str, Any]:
+        fitted = self._fit_ml()
+        return {
+            "ok": bool(fitted.get("dbscan")),
+            "trained": self._dbscan_trained,
+            "buffer_size": len(self._buffer),
+            "available": self._sklearn_available,
+            "n_clusters": self._dbscan_n_clusters,
+            "n_noise": self._dbscan_n_noise,
+            "eps": self.dbscan_eps,
+        }
+
     def train_ml_now(self) -> dict[str, Any]:
         fitted = self._fit_ml()
         return {
             "ok": any(fitted.values()),
             "iforest": self._iforest_trained,
             "lof": self._lof_trained,
+            "dbscan": self._dbscan_trained,
+            "n_clusters": self._dbscan_n_clusters,
             "buffer_size": len(self._buffer),
             "available": self._sklearn_available,
         }
