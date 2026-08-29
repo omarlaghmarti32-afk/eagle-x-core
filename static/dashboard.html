@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EAGLE-X Core</title>
+  <style>
+    :root { --bg:#0b1220; --card:#141e33; --accent:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --text:#e5eefc; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 1.25rem 1.5rem; border-bottom: 1px solid #1f2a44; display:flex; justify-content:space-between; align-items:center; }
+    h1 { margin:0; font-size:1.25rem; letter-spacing:0.04em; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap:1rem; padding:1.5rem; }
+    .card { background:var(--card); border-radius:12px; padding:1rem 1.2rem; border:1px solid #1f2a44; }
+    .label { opacity:0.7; font-size:0.8rem; }
+    .value { font-size:1.5rem; font-weight:700; margin-top:0.35rem; }
+    .ok { color: var(--ok); } .warn { color: var(--warn); }
+    table { width:calc(100% - 3rem); margin:0 1.5rem 2rem; border-collapse: collapse; }
+    th, td { text-align:right; padding:0.55rem 0.75rem; border-bottom:1px solid #1f2a44; font-size:0.9rem; }
+    th { opacity:0.7; font-weight:600; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>EAGLE-X Core</h1>
+    <span id="status" class="ok">…</span>
+  </header>
+  <div class="grid">
+    <div class="card"><div class="label">Version</div><div class="value" id="ver">—</div></div>
+    <div class="card"><div class="label">Uptime (s)</div><div class="value" id="up">—</div></div>
+    <div class="card"><div class="label">Scans</div><div class="value" id="scans">—</div></div>
+    <div class="card"><div class="label">Threats</div><div class="value" id="threats">—</div></div>
+    <div class="card"><div class="label">CPU %</div><div class="value" id="cpu">—</div></div>
+    <div class="card"><div class="label">RAM %</div><div class="value" id="mem">—</div></div>
+  </div>
+  <table>
+    <thead><tr><th>النوع</th><th>الثقة</th><th>الخطورة</th><th>الحالة</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <script>
+    async function refresh() {
+      try {
+        const [st, stats, th] = await Promise.all([
+          fetch('/api/status').then(r => r.json()),
+          fetch('/api/stats').then(r => r.json()),
+          fetch('/api/threats').then(r => r.json()),
+        ]);
+        document.getElementById('status').textContent = 'Operational';
+        document.getElementById('ver').textContent = st.version;
+        document.getElementById('up').textContent = st.uptime_seconds;
+        document.getElementById('scans').textContent = st.scans;
+        document.getElementById('threats').textContent = st.threats_total;
+        document.getElementById('cpu').textContent = (stats.host?.cpu_percent ?? 0).toFixed(1);
+        document.getElementById('mem').textContent = (stats.host?.mem_percent ?? 0).toFixed(1);
+        const tb = document.getElementById('rows');
+        tb.innerHTML = (th.threats || []).slice(0, 15).map(t =>
+          `<tr><td>${t.type}</td><td>${t.confidence}</td><td>${t.severity}</td><td>${t.status}</td></tr>`
+        ).join('') || '<tr><td colspan="4">لا تهديدات بعد</td></tr>';
+      } catch (e) {
+        document.getElementById('status').textContent = 'Offline';
+        document.getElementById('status').className = 'warn';
+      }
+    }
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>
