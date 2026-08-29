@@ -50,7 +50,10 @@ _task: Optional[asyncio.Task] = None
 
 async def live_loop() -> None:
     global scans
-    logger.info("Live monitor started (adaptive anomaly detector)")
+    logger.info(
+        "Live monitor started (EWMA + IsolationForest available=%s)",
+        detector._iforest_available,
+    )
     try:
         async for snap in monitor.stream():
             if not _running:
@@ -83,14 +86,15 @@ async def live_loop() -> None:
                         "type": analysis["threat_type"],
                         "confidence": analysis["confidence"],
                         "hits": analysis.get("hits"),
+                        "iforest": analysis.get("scores", {}).get("isolation_forest"),
                     },
                 )
                 logger.warning(
-                    "Threat #%s %s conf=%.2f hits=%s",
+                    "Threat #%s %s conf=%.2f iforest=%s",
                     tid,
                     analysis["threat_type"],
                     analysis["confidence"],
-                    analysis.get("hits"),
+                    analysis.get("scores", {}).get("isolation_forest", {}).get("anomaly"),
                 )
     except asyncio.CancelledError:
         logger.info("Live monitor cancelled")
@@ -101,7 +105,14 @@ async def live_loop() -> None:
 async def lifespan(app: FastAPI):
     global _task, _running
     _running = True
-    store.add_audit("startup", {"version": VERSION, "seal": SEAL})
+    store.add_audit(
+        "startup",
+        {
+            "version": VERSION,
+            "seal": SEAL,
+            "iforest": detector._iforest_available,
+        },
+    )
     if LIVE_MONITOR:
         _task = asyncio.create_task(live_loop())
     yield
@@ -117,7 +128,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="EAGLE-X Core",
-    description="Operational host security monitor with adaptive anomaly detection",
+    description="Host security monitor — EWMA + Isolation Forest ensemble",
     version=VERSION,
     lifespan=lifespan,
 )
@@ -171,6 +182,8 @@ async def health():
         "seal": SEAL,
         "uptime_seconds": int(time.time() - started),
         "scans": scans,
+        "iforest_available": detector._iforest_available,
+        "iforest_trained": detector._iforest_trained,
     }
 
 
@@ -196,6 +209,7 @@ async def health_deep():
         scans=scans,
         live=LIVE_MONITOR,
     )
+    report["isolation_forest"] = detector.baseline_snapshot().get("isolation_forest")
     code = 200 if report["status"] in ("ok", "degraded") else 503
     return JSONResponse(report, status_code=code)
 
@@ -255,6 +269,13 @@ async def reset_baseline(_: bool = Depends(require_token)):
     detector.reset_baseline()
     store.add_audit("baseline_reset", {})
     return {"ok": True, "baseline": detector.baseline_snapshot()}
+
+
+@app.post("/api/detector/iforest/train")
+async def train_iforest(_: bool = Depends(require_token)):
+    result = detector.train_iforest_now()
+    store.add_audit("iforest_train", result)
+    return result
 
 
 @app.post("/api/detect")

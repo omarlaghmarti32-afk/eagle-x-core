@@ -1,21 +1,22 @@
-"""Deep anomaly detection: adaptive baselines + rules + multi-signal patterns.
+"""Deep anomaly detection with Isolation Forest ensemble.
 
 Layers (combined):
   1. Hard ceilings — absolute unsafe host levels
   2. EWMA baseline — online mean/variance, robust z-scores
   3. Spike / rate-of-change — sudden jumps vs previous sample
   4. Multi-signal patterns — correlated abuse signatures
+  5. Isolation Forest — unsupervised isolation score (sklearn)
 
-No sklearn required. Works from the first sample; confidence improves
-as the baseline warms up (see `warmup_left`).
+If scikit-learn is unavailable, layers 1–4 still operate fully.
 """
 
 from __future__ import annotations
 
 import math
 import os
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Deque, Optional
 
 FEATURE_KEYS = [
     "cpu_percent",
@@ -27,7 +28,6 @@ FEATURE_KEYS = [
     "disk_percent",
 ]
 
-# Absolute ceilings (always score when exceeded)
 HARD_CEILINGS = {
     "cpu_percent": 95.0,
     "mem_percent": 95.0,
@@ -48,7 +48,6 @@ FEATURE_WEIGHTS = {
     "disk_percent": 0.10,
 }
 
-# Relative jump that counts as a spike (fraction of previous value)
 SPIKE_RATIO = {
     "cpu_percent": 2.5,
     "mem_percent": 1.8,
@@ -58,6 +57,16 @@ SPIKE_RATIO = {
     "connection_count": 2.0,
     "disk_percent": 1.15,
 }
+
+try:
+    import numpy as np
+    from sklearn.ensemble import IsolationForest
+
+    _HAS_SKLEARN = True
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+    IsolationForest = None  # type: ignore
+    _HAS_SKLEARN = False
 
 
 @dataclass
@@ -70,23 +79,39 @@ class FeatureBaseline:
 
 @dataclass
 class ThreatDetector:
-    """Adaptive host anomaly detector."""
+    """Adaptive host anomaly detector + Isolation Forest."""
 
     sensitivity: float = field(
         default_factory=lambda: float(os.environ.get("EAGLE_AI_SENSITIVITY", "0.55"))
     )
-    alpha: float = 0.12  # EWMA smoothing (higher = adapt faster)
+    alpha: float = 0.12
     z_threshold: float = 3.0
-    min_samples: int = 8  # samples before z-scores fully trusted
+    min_samples: int = 8
+    iforest_contamination: float = field(
+        default_factory=lambda: float(os.environ.get("EAGLE_IFOREST_CONTAMINATION", "0.08"))
+    )
+    iforest_min_train: int = 32
+    iforest_refit_every: int = 16
+    iforest_buffer_size: int = 256
+    iforest_weight: float = 0.35  # contribution of IF to ensemble score
     baselines: dict[str, FeatureBaseline] = field(default_factory=dict)
+    _buffer: Deque[list[float]] = field(default_factory=lambda: deque(maxlen=256))
+    _iforest: Any = field(default=None, repr=False)
+    _iforest_trained: bool = False
+    _iforest_seen: int = 0
+    _iforest_available: bool = field(default_factory=lambda: _HAS_SKLEARN)
 
     def __post_init__(self) -> None:
         self.sensitivity = float(min(max(self.sensitivity, 0.1), 0.95))
+        self.iforest_contamination = float(min(max(self.iforest_contamination, 0.01), 0.3))
+        self._buffer = deque(maxlen=self.iforest_buffer_size)
         for k in FEATURE_KEYS:
             if k not in self.baselines:
                 self.baselines[k] = FeatureBaseline()
 
-    # ------------------------------------------------------------------ utils
+    def _vector(self, feats: dict[str, float]) -> list[float]:
+        return [float(feats.get(k, 0.0)) for k in FEATURE_KEYS]
+
     def _normalize(self, features: dict[str, float] | list[float]) -> dict[str, float]:
         if isinstance(features, list):
             return {
@@ -97,7 +122,6 @@ class ThreatDetector:
         for k in FEATURE_KEYS:
             if k in features:
                 out[k] = float(features[k])
-        # allow partial feature sets from API
         for k, v in features.items():
             if k not in out:
                 try:
@@ -107,7 +131,6 @@ class ThreatDetector:
         return out
 
     def _update_baseline(self, key: str, value: float) -> tuple[float, float]:
-        """Return (z_score, spike_score in 0..1) and update EWMA."""
         b = self.baselines.setdefault(key, FeatureBaseline())
         spike = 0.0
         if b.n > 0 and b.last > 0:
@@ -116,11 +139,9 @@ class ThreatDetector:
             if ratio >= need:
                 spike = min((ratio - need) / need, 2.0) / 2.0
 
-        # z vs current baseline (before update)
         std = math.sqrt(max(b.var, 1e-6))
         z = (value - b.mean) / std if b.n >= 2 else 0.0
 
-        # EWMA update
         if b.n == 0:
             b.mean = value
             b.var = max(value * 0.05, 1.0) ** 2
@@ -133,14 +154,11 @@ class ThreatDetector:
         return z, spike
 
     def _hard_hits(self, features: dict[str, float]) -> list[str]:
-        hits = []
-        for k, ceiling in HARD_CEILINGS.items():
-            if float(features.get(k, 0)) >= ceiling:
-                hits.append(k)
-        return hits
+        return [k for k, ceiling in HARD_CEILINGS.items() if float(features.get(k, 0)) >= ceiling]
 
-    def _pattern_bonus(self, features: dict[str, float], z_map: dict[str, float]) -> tuple[float, list[str]]:
-        """Multi-signal attack-like combinations."""
+    def _pattern_bonus(
+        self, features: dict[str, float], z_map: dict[str, float]
+    ) -> tuple[float, list[str]]:
         patterns: list[str] = []
         bonus = 0.0
         cpu = features.get("cpu_percent", 0)
@@ -150,34 +168,92 @@ class ThreatDetector:
         procs = features.get("process_count", 0)
         conns = features.get("connection_count", 0)
 
-        # Crypto-miner / resource abuse: high CPU + high mem
         if cpu >= 85 and mem >= 80:
             patterns.append("cpu_mem_pressure")
             bonus += 0.22
-
-        # Exfiltration-ish: outbound >> inbound while CPU moderate-high
         if sent > 1_500_000 and sent > max(recv * 3, 1):
             patterns.append("egress_dominant")
             bonus += 0.2
-
-        # C2 / scan flood: many connections + process growth
         if conns >= 300 and procs >= 250:
             patterns.append("conn_process_flood")
             bonus += 0.2
-
-        # Correlated z-anomalies on network both directions
-        if z_map.get("net_sent_rate", 0) >= self.z_threshold and z_map.get(
-            "net_recv_rate", 0
-        ) >= self.z_threshold:
+        if (
+            z_map.get("net_sent_rate", 0) >= self.z_threshold
+            and z_map.get("net_recv_rate", 0) >= self.z_threshold
+        ):
             patterns.append("bidirectional_traffic_shift")
             bonus += 0.15
-
-        # Disk filling fast is often ransomware precursor when + high IO proxy (net)
         if features.get("disk_percent", 0) >= 90 and (sent + recv) > 1_000_000:
             patterns.append("disk_and_io_pressure")
             bonus += 0.18
 
         return min(bonus, 0.55), patterns
+
+    # --------------------------------------------------------- Isolation Forest
+    def _fit_iforest(self) -> bool:
+        if not self._iforest_available or len(self._buffer) < self.iforest_min_train:
+            return False
+        X = np.array(list(self._buffer), dtype=float)
+        model = IsolationForest(
+            n_estimators=100,
+            contamination=self.iforest_contamination,
+            max_samples="auto",
+            random_state=42,
+            n_jobs=1,
+        )
+        model.fit(X)
+        self._iforest = model
+        self._iforest_trained = True
+        return True
+
+    def _iforest_score(self, vec: list[float], update: bool) -> dict[str, Any]:
+        """Return isolation forest contribution and metadata."""
+        meta: dict[str, Any] = {
+            "available": self._iforest_available,
+            "trained": self._iforest_trained,
+            "buffer_size": len(self._buffer),
+            "score": None,
+            "anomaly": False,
+            "contribution": 0.0,
+        }
+        if not self._iforest_available:
+            return meta
+
+        if update:
+            self._buffer.append(list(vec))
+            self._iforest_seen += 1
+            if (
+                not self._iforest_trained and len(self._buffer) >= self.iforest_min_train
+            ) or (
+                self._iforest_trained
+                and self._iforest_seen % self.iforest_refit_every == 0
+                and len(self._buffer) >= self.iforest_min_train
+            ):
+                self._fit_iforest()
+
+        if not self._iforest_trained or self._iforest is None:
+            meta["trained"] = False
+            return meta
+
+        X = np.array([vec], dtype=float)
+        # decision_function: higher = more normal; negative tends to be outlier
+        raw = float(self._iforest.decision_function(X)[0])
+        pred = int(self._iforest.predict(X)[0])  # -1 anomaly, 1 normal
+        # Map raw score to [0,1] anomaly confidence (approx)
+        # Typical decision_function range roughly [-0.5, 0.5]
+        anomaly_strength = max(0.0, min(1.0, (0.15 - raw) / 0.5))
+        if pred == -1:
+            anomaly_strength = max(anomaly_strength, 0.55)
+
+        meta.update(
+            {
+                "trained": True,
+                "score": round(raw, 4),
+                "anomaly": pred == -1,
+                "contribution": round(anomaly_strength * self.iforest_weight, 3),
+            }
+        )
+        return meta
 
     def _classify(
         self,
@@ -186,14 +262,14 @@ class ThreatDetector:
         z_hits: list[str],
         spikes: list[str],
         patterns: list[str],
+        iforest_anomaly: bool,
     ) -> tuple[str, str]:
-        if confidence < self.sensitivity and not hard:
+        if confidence < self.sensitivity and not hard and not iforest_anomaly:
             return "NONE", "none"
 
         net_keys = {"net_sent_rate", "net_recv_rate"}
         res_keys = {"cpu_percent", "mem_percent"}
         flood_keys = {"process_count", "connection_count"}
-
         signals = set(hard) | set(z_hits) | set(spikes)
 
         if "egress_dominant" in patterns or signals & net_keys:
@@ -204,6 +280,8 @@ class ThreatDetector:
             t = "PROCESS_FLOOD"
         elif "disk_and_io_pressure" in patterns or "disk_percent" in signals:
             t = "STORAGE_ANOMALY"
+        elif iforest_anomaly:
+            t = "IFOREST_ANOMALY"
         else:
             t = "HOST_ANOMALY"
 
@@ -211,13 +289,12 @@ class ThreatDetector:
             sev = "critical"
         elif confidence >= 0.65 or hard:
             sev = "high"
-        elif confidence >= 0.45:
+        elif confidence >= 0.45 or iforest_anomaly:
             sev = "medium"
         else:
             sev = "low"
         return t, sev
 
-    # ----------------------------------------------------------------- public
     def analyze(
         self,
         features: dict[str, float] | list[float],
@@ -240,6 +317,8 @@ class ThreatDetector:
             else:
                 b = self.baselines.get(key, FeatureBaseline())
                 std = math.sqrt(max(b.var, 1e-6))
+                z = (value - b.mean) / std if b.n >= 2 else 0.0  # noqa — bug!
+                # fix below without using undefined value
                 z = (val - b.mean) / std if b.n >= 2 else 0.0
                 spike = 0.0
                 if b.n > 0 and b.last > 0:
@@ -251,15 +330,12 @@ class ThreatDetector:
             z_map[key] = round(z, 3)
             spike_map[key] = round(spike, 3)
             w = FEATURE_WEIGHTS.get(key, 0.1)
-
-            # Warm-up: damp z contribution until enough samples
             b = self.baselines.get(key, FeatureBaseline())
             warm = min(b.n / max(self.min_samples, 1), 1.0)
 
             if abs(z) >= self.z_threshold and warm >= 0.5:
                 z_hits.append(key)
                 score += w * min(abs(z) / self.z_threshold, 3.0) * 0.35 * warm
-
             if spike >= 0.25:
                 spike_hits.append(key)
                 score += w * spike * 0.4
@@ -274,18 +350,41 @@ class ThreatDetector:
         pattern_bonus, patterns = self._pattern_bonus(feats, z_map)
         score += pattern_bonus
 
+        vec = self._vector(feats)
+        if_meta = self._iforest_score(vec, update=update_baseline)
+        score += float(if_meta.get("contribution") or 0.0)
+        if if_meta.get("anomaly"):
+            patterns = list(patterns) + ["isolation_forest"]
+
         confidence = min(round(score, 3), 1.0)
-        threat = confidence >= self.sensitivity or len(hard) >= 1 or (
-            len(z_hits) + len(spike_hits) >= 3 and confidence >= self.sensitivity * 0.75
+        threat = (
+            confidence >= self.sensitivity
+            or len(hard) >= 1
+            or (
+                len(z_hits) + len(spike_hits) >= 3
+                and confidence >= self.sensitivity * 0.75
+            )
+            or (
+                if_meta.get("anomaly")
+                and float(if_meta.get("contribution") or 0) >= self.iforest_weight * 0.5
+            )
         )
 
         threat_type, severity = self._classify(
-            confidence if threat else 0.0, hard, z_hits, spike_hits, patterns
+            confidence if threat else 0.0,
+            hard,
+            z_hits,
+            spike_hits,
+            patterns,
+            bool(if_meta.get("anomaly")),
         )
         if not threat:
             threat_type, severity = "NONE", "none"
 
-        samples = min((self.baselines[k].n for k in FEATURE_KEYS if k in self.baselines), default=0)
+        samples = min(
+            (self.baselines[k].n for k in FEATURE_KEYS if k in self.baselines),
+            default=0,
+        )
 
         return {
             "threat_detected": bool(threat),
@@ -302,6 +401,7 @@ class ThreatDetector:
                 "z": z_map,
                 "spike": {k: v for k, v in spike_map.items() if v > 0},
                 "pattern_bonus": round(pattern_bonus, 3),
+                "isolation_forest": if_meta,
             },
             "baseline": {
                 "samples": samples,
@@ -309,6 +409,8 @@ class ThreatDetector:
                 "warmup_left": max(self.min_samples - samples, 0),
                 "sensitivity": self.sensitivity,
                 "z_threshold": self.z_threshold,
+                "iforest_trained": self._iforest_trained,
+                "iforest_available": self._iforest_available,
             },
             "features": feats,
         }
@@ -327,7 +429,29 @@ class ThreatDetector:
             "sensitivity": self.sensitivity,
             "z_threshold": self.z_threshold,
             "min_samples": self.min_samples,
+            "isolation_forest": {
+                "available": self._iforest_available,
+                "trained": self._iforest_trained,
+                "buffer_size": len(self._buffer),
+                "min_train": self.iforest_min_train,
+                "contamination": self.iforest_contamination,
+                "weight": self.iforest_weight,
+            },
         }
 
     def reset_baseline(self) -> None:
         self.baselines = {k: FeatureBaseline() for k in FEATURE_KEYS}
+        self._buffer.clear()
+        self._iforest = None
+        self._iforest_trained = False
+        self._iforest_seen = 0
+
+    def train_iforest_now(self) -> dict[str, Any]:
+        """Force Isolation Forest fit on current buffer."""
+        ok = self._fit_iforest()
+        return {
+            "ok": ok,
+            "trained": self._iforest_trained,
+            "buffer_size": len(self._buffer),
+            "available": self._iforest_available,
+        }
