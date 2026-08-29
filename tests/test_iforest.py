@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.detector import ThreatDetector, _HAS_SKLEARN, FEATURE_KEYS
+from app.detector import ThreatDetector, _HAS_SKLEARN
 
 NORMAL = {
     "cpu_percent": 12,
@@ -17,8 +17,7 @@ NORMAL = {
 
 @pytest.mark.skipif(not _HAS_SKLEARN, reason="sklearn not installed")
 def test_iforest_trains_and_flags_outlier():
-    d = ThreatDetector(sensitivity=0.45, iforest_min_train=32, iforest_refit_every=8)
-    # feed mostly normal traffic
+    d = ThreatDetector(sensitivity=0.45, ml_min_train=32, ml_refit_every=8)
     for i in range(40):
         sample = dict(NORMAL)
         sample["cpu_percent"] = 10 + (i % 5)
@@ -29,7 +28,6 @@ def test_iforest_trains_and_flags_outlier():
     snap = d.baseline_snapshot()
     assert snap["isolation_forest"]["trained"] is True
 
-    # strong outlier
     hot = {
         "cpu_percent": 99,
         "mem_percent": 97,
@@ -44,13 +42,12 @@ def test_iforest_trains_and_flags_outlier():
     if_meta = r["scores"]["isolation_forest"]
     assert if_meta["available"] is True
     assert if_meta["trained"] is True
-    # hard ceilings alone should fire; IF may also
     assert r["confidence"] > 0.4
 
 
 @pytest.mark.skipif(not _HAS_SKLEARN, reason="sklearn not installed")
 def test_force_train():
-    d = ThreatDetector(iforest_min_train=20)
+    d = ThreatDetector(ml_min_train=20)
     for _ in range(25):
         d.analyze(NORMAL)
     result = d.train_iforest_now()
