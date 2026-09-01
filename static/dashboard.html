@@ -5,26 +5,56 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>EAGLE-X Core</title>
   <style>
-    :root { --bg:#0b1220; --card:#141e33; --accent:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --text:#e5eefc; }
+    :root {
+      --bg:#0b1220; --card:#141e33; --accent:#3b82f6; --ok:#22c55e;
+      --warn:#f59e0b; --bad:#ef4444; --text:#e5eefc; --muted:#8b9bb8;
+    }
     * { box-sizing: border-box; }
-    body { margin:0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
-    header { padding: 1.25rem 1.5rem; border-bottom: 1px solid #1f2a44; display:flex; justify-content:space-between; align-items:center; }
-    h1 { margin:0; font-size:1.25rem; letter-spacing:0.04em; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap:1rem; padding:1.5rem; }
-    .card { background:var(--card); border-radius:12px; padding:1rem 1.2rem; border:1px solid #1f2a44; }
-    .label { opacity:0.7; font-size:0.8rem; }
-    .value { font-size:1.5rem; font-weight:700; margin-top:0.35rem; }
-    .ok { color: var(--ok); } .warn { color: var(--warn); }
-    table { width:calc(100% - 3rem); margin:0 1.5rem 2rem; border-collapse: collapse; }
-    th, td { text-align:right; padding:0.55rem 0.75rem; border-bottom:1px solid #1f2a44; font-size:0.9rem; }
-    th { opacity:0.7; font-weight:600; }
+    body { margin:0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+    header {
+      padding: 1.1rem 1.5rem; border-bottom: 1px solid #1f2a44;
+      display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap;
+    }
+    h1 { margin:0; font-size:1.2rem; letter-spacing:0.04em; }
+    .badge {
+      display:inline-flex; align-items:center; gap:0.35rem; padding:0.25rem 0.65rem;
+      border-radius:999px; font-size:0.78rem; background:#1a2744; border:1px solid #243556;
+    }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); }
+    .dot.warn { background:var(--warn); }
+    .dot.bad { background:var(--bad); }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap:0.9rem; padding:1.25rem 1.5rem; }
+    .card { background:var(--card); border-radius:12px; padding:0.95rem 1.1rem; border:1px solid #1f2a44; }
+    .label { color:var(--muted); font-size:0.75rem; text-transform:uppercase; letter-spacing:0.04em; }
+    .value { font-size:1.4rem; font-weight:700; margin-top:0.3rem; }
+    .section { padding:0 1.5rem 1.25rem; }
+    .section h2 { font-size:0.95rem; margin:0 0 0.75rem; color:var(--muted); font-weight:600; }
+    .models { display:flex; flex-wrap:wrap; gap:0.5rem; }
+    .chip {
+      padding:0.35rem 0.7rem; border-radius:8px; font-size:0.78rem; border:1px solid #243556;
+      background:#101a2e;
+    }
+    .chip.on { border-color:#166534; background:#052e16; color:#86efac; }
+    .chip.off { opacity:0.55; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { text-align:right; padding:0.55rem 0.6rem; border-bottom:1px solid #1f2a44; font-size:0.85rem; }
+    th { color:var(--muted); font-weight:600; }
+    .sev-high, .sev-critical { color:var(--bad); font-weight:600; }
+    .sev-medium { color:var(--warn); }
+    .votes { display:flex; flex-wrap:wrap; gap:0.25rem; }
+    .vote {
+      font-size:0.7rem; padding:0.15rem 0.4rem; border-radius:4px;
+      background:#1e3a5f; color:#93c5fd;
+    }
+    footer { padding:1rem 1.5rem 2rem; color:var(--muted); font-size:0.75rem; }
   </style>
 </head>
 <body>
   <header>
     <h1>EAGLE-X Core</h1>
-    <span id="status" class="ok">…</span>
+    <span class="badge"><span class="dot" id="dot"></span><span id="status">…</span></span>
   </header>
+
   <div class="grid">
     <div class="card"><div class="label">Version</div><div class="value" id="ver">—</div></div>
     <div class="card"><div class="label">Uptime (s)</div><div class="value" id="up">—</div></div>
@@ -32,33 +62,125 @@
     <div class="card"><div class="label">Threats</div><div class="value" id="threats">—</div></div>
     <div class="card"><div class="label">CPU %</div><div class="value" id="cpu">—</div></div>
     <div class="card"><div class="label">RAM %</div><div class="value" id="mem">—</div></div>
+    <div class="card"><div class="label">Webhooks</div><div class="value" id="hooks">—</div></div>
+    <div class="card"><div class="label">Models ready</div><div class="value" id="models-n">—</div></div>
   </div>
-  <table>
-    <thead><tr><th>النوع</th><th>الثقة</th><th>الخطورة</th><th>الحالة</th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
+
+  <div class="section">
+    <h2>حالة نماذج التجميع</h2>
+    <div class="models" id="models"></div>
+  </div>
+
+  <div class="section">
+    <h2>آخر التهديدات + أصوات الإجماع</h2>
+    <div class="card" style="padding:0; overflow:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>النوع</th>
+            <th>الثقة</th>
+            <th>الخطورة</th>
+            <th>الحالة</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>خط الأساس (عيّنات)</h2>
+    <div class="card" style="padding:0; overflow:auto;">
+      <table>
+        <thead>
+          <tr><th>المؤشر</th><th>mean</th><th>std</th><th>n</th><th>last</th></tr>
+        </thead>
+        <tbody id="base-rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer id="foot">تحديث كل 3 ثوانٍ · EAGLE-X Core</footer>
+
   <script>
+    const MODEL_LABELS = {
+      iforest: 'Isolation Forest',
+      lof: 'LOF',
+      dbscan: 'DBSCAN',
+      ocsvm: 'One-Class SVM',
+      elliptic: 'Elliptic',
+      pca: 'PCA',
+      cusum: 'CUSUM',
+    };
+
+    function sevClass(s) {
+      s = (s || '').toLowerCase();
+      if (s === 'critical' || s === 'high') return 'sev-high';
+      if (s === 'medium') return 'sev-medium';
+      return '';
+    }
+
     async function refresh() {
       try {
-        const [st, stats, th] = await Promise.all([
+        const [health, st, stats, th, base] = await Promise.all([
+          fetch('/api/health').then(r => r.json()),
           fetch('/api/status').then(r => r.json()),
           fetch('/api/stats').then(r => r.json()),
           fetch('/api/threats').then(r => r.json()),
+          fetch('/api/detector/baseline').then(r => r.json()),
         ]);
-        document.getElementById('status').textContent = 'Operational';
-        document.getElementById('ver').textContent = st.version;
-        document.getElementById('up').textContent = st.uptime_seconds;
-        document.getElementById('scans').textContent = st.scans;
-        document.getElementById('threats').textContent = st.threats_total;
+
+        const online = health.status === 'ok';
+        document.getElementById('status').textContent = online ? 'Operational' : 'Degraded';
+        document.getElementById('dot').className = 'dot' + (online ? '' : ' warn');
+
+        document.getElementById('ver').textContent = health.version || st.version;
+        document.getElementById('up').textContent = health.uptime_seconds ?? st.uptime_seconds;
+        document.getElementById('scans').textContent = health.scans ?? st.scans;
+        document.getElementById('threats').textContent = st.threats_total ?? 0;
         document.getElementById('cpu').textContent = (stats.host?.cpu_percent ?? 0).toFixed(1);
         document.getElementById('mem').textContent = (stats.host?.mem_percent ?? 0).toFixed(1);
+        document.getElementById('hooks').textContent =
+          (health.webhooks_sent ?? 0) + (health.webhook_configured ? '' : ' (off)');
+
+        const models = health.models || {};
+        const entries = Object.entries(MODEL_LABELS);
+        let ready = 0;
+        document.getElementById('models').innerHTML = entries.map(([k, label]) => {
+          const on = !!models[k];
+          if (on) ready++;
+          return `<span class="chip ${on ? 'on' : 'off'}">${label}${on ? ' ✓' : ' …'}</span>`;
+        }).join('');
+        document.getElementById('models-n').textContent = ready + '/' + entries.length;
+
         const tb = document.getElementById('rows');
-        tb.innerHTML = (th.threats || []).slice(0, 15).map(t =>
-          `<tr><td>${t.type}</td><td>${t.confidence}</td><td>${t.severity}</td><td>${t.status}</td></tr>`
-        ).join('') || '<tr><td colspan="4">لا تهديدات بعد</td></tr>';
+        const list = (th.threats || []).slice(0, 20);
+        tb.innerHTML = list.length
+          ? list.map(t => `
+              <tr>
+                <td>${t.id}</td>
+                <td>${t.type}</td>
+                <td>${Number(t.confidence).toFixed(3)}</td>
+                <td class="${sevClass(t.severity)}">${t.severity}</td>
+                <td>${t.status}</td>
+              </tr>`).join('')
+          : '<tr><td colspan="5">لا تهديدات بعد — النظام يتعلم خط الأساس</td></tr>';
+
+        const feats = (base.features || {});
+        document.getElementById('base-rows').innerHTML = Object.keys(feats).length
+          ? Object.entries(feats).map(([k, v]) =>
+              `<tr><td>${k}</td><td>${v.mean}</td><td>${v.std}</td><td>${v.n}</td><td>${v.last}</td></tr>`
+            ).join('')
+          : '<tr><td colspan="5">لا بيانات خط أساس بعد</td></tr>';
+
+        document.getElementById('foot').textContent =
+          'آخر تحديث: ' + new Date().toLocaleTimeString() +
+          ' · sklearn=' + (health.sklearn_available ? 'yes' : 'no') +
+          ' · EAGLE-X Core ' + (health.version || '');
       } catch (e) {
         document.getElementById('status').textContent = 'Offline';
-        document.getElementById('status').className = 'warn';
+        document.getElementById('dot').className = 'dot bad';
       }
     }
     refresh();
