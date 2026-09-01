@@ -43,7 +43,10 @@ _task: Optional[asyncio.Task] = None
 
 async def live_loop() -> None:
     global scans
-    logger.info("Live monitor started (IF+LOF+DBSCAN sklearn=%s)", detector._sklearn_available)
+    logger.info(
+        "Live monitor started (ensemble IF+LOF+DBSCAN+OCSVM+Elliptic+PCA+CUSUM sklearn=%s)",
+        detector._sklearn_available,
+    )
     try:
         async for snap in monitor.stream():
             if not _running:
@@ -76,19 +79,15 @@ async def live_loop() -> None:
                         "type": analysis["threat_type"],
                         "confidence": analysis["confidence"],
                         "hits": analysis.get("hits"),
-                        "iforest": analysis.get("scores", {}).get("isolation_forest"),
-                        "lof": analysis.get("scores", {}).get("lof"),
-                        "dbscan": analysis.get("scores", {}).get("dbscan"),
+                        "consensus": analysis.get("scores", {}).get("consensus"),
                     },
                 )
                 logger.warning(
-                    "Threat #%s %s conf=%.2f IF=%s LOF=%s DBSCAN=%s",
+                    "Threat #%s %s conf=%.2f votes=%s",
                     tid,
                     analysis["threat_type"],
                     analysis["confidence"],
-                    analysis.get("scores", {}).get("isolation_forest", {}).get("anomaly"),
-                    analysis.get("scores", {}).get("lof", {}).get("anomaly"),
-                    analysis.get("scores", {}).get("dbscan", {}).get("anomaly"),
+                    analysis.get("scores", {}).get("consensus", {}).get("votes"),
                 )
     except asyncio.CancelledError:
         logger.info("Live monitor cancelled")
@@ -118,7 +117,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="EAGLE-X Core",
-    description="Host security monitor — EWMA + Isolation Forest + LOF + DBSCAN",
+    description=(
+        "Host security monitor — EWMA + Isolation Forest + LOF + DBSCAN + "
+        "One-Class SVM + Elliptic Envelope + PCA + CUSUM + consensus"
+    ),
     version=VERSION,
     lifespan=lifespan,
 )
@@ -172,10 +174,16 @@ async def health():
         "seal": SEAL,
         "uptime_seconds": int(time.time() - started),
         "scans": scans,
-        "iforest_trained": detector._iforest_trained,
-        "lof_trained": detector._lof_trained,
-        "dbscan_trained": detector._dbscan_trained,
         "sklearn_available": detector._sklearn_available,
+        "models": {
+            "iforest": detector._iforest_trained,
+            "lof": detector._lof_trained,
+            "dbscan": detector._dbscan_trained,
+            "ocsvm": detector._ocsvm_trained,
+            "elliptic": detector._elliptic_trained,
+            "pca": detector._pca_trained,
+            "cusum": True,
+        },
     }
 
 
@@ -201,10 +209,7 @@ async def health_deep():
         scans=scans,
         live=LIVE_MONITOR,
     )
-    snap = detector.baseline_snapshot()
-    report["isolation_forest"] = snap.get("isolation_forest")
-    report["lof"] = snap.get("lof")
-    report["dbscan"] = snap.get("dbscan")
+    report["detector"] = detector.baseline_snapshot()
     code = 200 if report["status"] in ("ok", "degraded") else 503
     return JSONResponse(report, status_code=code)
 
@@ -264,27 +269,6 @@ async def reset_baseline(_: bool = Depends(require_token)):
     detector.reset_baseline()
     store.add_audit("baseline_reset", {})
     return {"ok": True, "baseline": detector.baseline_snapshot()}
-
-
-@app.post("/api/detector/iforest/train")
-async def train_iforest(_: bool = Depends(require_token)):
-    result = detector.train_iforest_now()
-    store.add_audit("iforest_train", result)
-    return result
-
-
-@app.post("/api/detector/lof/train")
-async def train_lof(_: bool = Depends(require_token)):
-    result = detector.train_lof_now()
-    store.add_audit("lof_train", result)
-    return result
-
-
-@app.post("/api/detector/dbscan/train")
-async def train_dbscan(_: bool = Depends(require_token)):
-    result = detector.train_dbscan_now()
-    store.add_audit("dbscan_train", result)
-    return result
 
 
 @app.post("/api/detector/ml/train")
