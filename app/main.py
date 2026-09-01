@@ -15,12 +15,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .config import API_TOKEN, LIVE_MONITOR, LOG_DIR, LOG_LEVEL, SEAL, VERSION
+from .config import (
+    API_TOKEN,
+    LIVE_MONITOR,
+    LOG_DIR,
+    LOG_LEVEL,
+    SEAL,
+    STATE_SAVE_EVERY,
+    VERSION,
+    WEBHOOK_URL,
+)
 from .crypto import CryptoEngine
 from .db import Store
 from .detector import ThreatDetector
 from .health import run_checks
 from .monitor import HostMonitor
+from .persist import load_all, save_all
+from .webhook import build_payload, send_webhook_sync, should_notify
 
 LOG_FILE = LOG_DIR / "eagle-core.log"
 logging.basicConfig(
@@ -39,13 +50,28 @@ started = time.time()
 scans = 0
 _running = True
 _task: Optional[asyncio.Task] = None
+_webhooks_sent = 0
+
+
+async def _fire_webhook(analysis: dict, threat_id: int, source: str) -> None:
+    global _webhooks_sent
+    if not should_notify(analysis):
+        return
+    payload = build_payload(analysis, threat_id=threat_id, source=source)
+    result = await asyncio.to_thread(send_webhook_sync, payload)
+    store.add_audit("webhook", {"threat_id": threat_id, **result})
+    if result.get("ok"):
+        _webhooks_sent += 1
+        logger.info("Webhook delivered for threat #%s", threat_id)
+    else:
+        logger.warning("Webhook not delivered: %s", result)
 
 
 async def live_loop() -> None:
     global scans
     logger.info(
-        "Live monitor started (ensemble IF+LOF+DBSCAN+OCSVM+Elliptic+PCA+CUSUM sklearn=%s)",
-        detector._sklearn_available,
+        "Live monitor started (ensemble + webhook=%s)",
+        bool(WEBHOOK_URL),
     )
     try:
         async for snap in monitor.stream():
@@ -60,6 +86,9 @@ async def live_loop() -> None:
                     snap.get("cpu_percent", 0),
                     snap.get("mem_percent", 0),
                 )
+            if STATE_SAVE_EVERY > 0 and scans % STATE_SAVE_EVERY == 0:
+                await asyncio.to_thread(save_all, detector)
+
             if analysis["threat_detected"]:
                 sealed = crypto.seal(analysis)
                 tid = store.add_threat(
@@ -78,7 +107,6 @@ async def live_loop() -> None:
                         "id": tid,
                         "type": analysis["threat_type"],
                         "confidence": analysis["confidence"],
-                        "hits": analysis.get("hits"),
                         "consensus": analysis.get("scores", {}).get("consensus"),
                     },
                 )
@@ -89,6 +117,7 @@ async def live_loop() -> None:
                     analysis["confidence"],
                     analysis.get("scores", {}).get("consensus", {}).get("votes"),
                 )
+                asyncio.create_task(_fire_webhook(analysis, tid, "live_monitor"))
     except asyncio.CancelledError:
         logger.info("Live monitor cancelled")
         raise
@@ -98,10 +127,18 @@ async def live_loop() -> None:
 async def lifespan(app: FastAPI):
     global _task, _running
     _running = True
+    restored = load_all(detector)
     store.add_audit(
         "startup",
-        {"version": VERSION, "seal": SEAL, "sklearn": detector._sklearn_available},
+        {
+            "version": VERSION,
+            "seal": SEAL,
+            "sklearn": detector._sklearn_available,
+            "restored": restored,
+            "webhook": bool(WEBHOOK_URL),
+        },
     )
+    logger.info("Startup restore: %s", restored)
     if LIVE_MONITOR:
         _task = asyncio.create_task(live_loop())
     yield
@@ -112,14 +149,14 @@ async def lifespan(app: FastAPI):
             await _task
         except asyncio.CancelledError:
             pass
-    store.add_audit("shutdown", {})
+    save_all(detector)
+    store.add_audit("shutdown", {"scans": scans})
 
 
 app = FastAPI(
     title="EAGLE-X Core",
     description=(
-        "Host security monitor — EWMA + Isolation Forest + LOF + DBSCAN + "
-        "One-Class SVM + Elliptic Envelope + PCA + CUSUM + consensus"
+        "Host security monitor — multi-model ensemble + webhooks + persistent state"
     ),
     version=VERSION,
     lifespan=lifespan,
@@ -147,6 +184,7 @@ class DetectBody(BaseModel):
     features: dict[str, float] | list[float] = Field(...)
     indicator: Optional[str] = None
     update_baseline: bool = True
+    notify: bool = False
 
 
 class HealBody(BaseModel):
@@ -174,6 +212,8 @@ async def health():
         "seal": SEAL,
         "uptime_seconds": int(time.time() - started),
         "scans": scans,
+        "webhooks_sent": _webhooks_sent,
+        "webhook_configured": bool(WEBHOOK_URL),
         "sklearn_available": detector._sklearn_available,
         "models": {
             "iforest": detector._iforest_trained,
@@ -210,6 +250,7 @@ async def health_deep():
         live=LIVE_MONITOR,
     )
     report["detector"] = detector.baseline_snapshot()
+    report["webhook_configured"] = bool(WEBHOOK_URL)
     code = 200 if report["status"] in ("ok", "degraded") else 503
     return JSONResponse(report, status_code=code)
 
@@ -223,6 +264,8 @@ async def status():
         "scans": scans,
         "threats_total": store.count_threats(),
         "live_monitor": LIVE_MONITOR,
+        "webhooks_sent": _webhooks_sent,
+        "webhook_configured": bool(WEBHOOK_URL),
         "detector": detector.baseline_snapshot(),
         "crypto_pub": crypto.public_key_b64()[:16] + "…",
     }
@@ -261,12 +304,14 @@ async def detector_baseline():
 async def set_sensitivity(body: SensitivityBody, _: bool = Depends(require_token)):
     detector.sensitivity = float(body.sensitivity)
     store.add_audit("sensitivity", {"value": detector.sensitivity})
+    save_all(detector)
     return {"ok": True, "sensitivity": detector.sensitivity}
 
 
 @app.post("/api/detector/reset")
 async def reset_baseline(_: bool = Depends(require_token)):
     detector.reset_baseline()
+    save_all(detector)
     store.add_audit("baseline_reset", {})
     return {"ok": True, "baseline": detector.baseline_snapshot()}
 
@@ -274,16 +319,32 @@ async def reset_baseline(_: bool = Depends(require_token)):
 @app.post("/api/detector/ml/train")
 async def train_ml(_: bool = Depends(require_token)):
     result = detector.train_ml_now()
-    store.add_audit("ml_train", result)
-    return result
+    paths = save_all(detector)
+    store.add_audit("ml_train", {**result, **paths})
+    return {**result, "saved": paths}
+
+
+@app.post("/api/detector/state/save")
+async def state_save(_: bool = Depends(require_token)):
+    paths = save_all(detector)
+    store.add_audit("state_save", paths)
+    return {"ok": True, "saved": paths}
+
+
+@app.post("/api/detector/state/load")
+async def state_load(_: bool = Depends(require_token)):
+    restored = load_all(detector)
+    store.add_audit("state_load", restored)
+    return {"ok": True, "restored": restored, "baseline": detector.baseline_snapshot()}
 
 
 @app.post("/api/detect")
 async def detect(body: DetectBody, _: bool = Depends(require_token)):
     analysis = detector.analyze(body.features, update_baseline=body.update_baseline)
     sealed = crypto.seal(analysis)
+    tid = None
     if analysis["threat_detected"]:
-        store.add_threat(
+        tid = store.add_threat(
             threat_type=analysis["threat_type"],
             confidence=analysis["confidence"],
             severity=analysis["severity"],
@@ -295,7 +356,9 @@ async def detect(body: DetectBody, _: bool = Depends(require_token)):
         )
         if body.indicator:
             store.add_block(body.indicator, analysis["threat_type"])
-    return {"analysis": analysis, "seal": sealed}
+        if body.notify:
+            await _fire_webhook(analysis, tid or 0, "api")
+    return {"analysis": analysis, "seal": sealed, "threat_id": tid}
 
 
 @app.post("/api/heal")
