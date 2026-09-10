@@ -7,14 +7,27 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .config import BASELINE_PATH, MODEL_PATH
+from .config import BASELINE_PATH, DATA_DIR, MODEL_PATH
 from .detector import FEATURE_KEYS, FeatureBaseline, ThreatDetector
 
 logger = logging.getLogger("eagle-core.persist")
 
 
+def _ensure_under_data(path: Path, *, strict: bool = False) -> Path:
+    """Resolve path; in strict mode require it under DATA_DIR."""
+    path = Path(path).resolve()
+    root = DATA_DIR.resolve()
+    try:
+        path.relative_to(root)
+        return path
+    except ValueError:
+        if strict:
+            raise ValueError(f"path escapes DATA_DIR: {path}")
+        return path
+
+
 def save_baselines(detector: ThreatDetector, path: Path | None = None) -> Path:
-    path = Path(path or BASELINE_PATH)
+    path = _ensure_under_data(Path(path or BASELINE_PATH))
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "sensitivity": detector.sensitivity,
@@ -35,7 +48,7 @@ def save_baselines(detector: ThreatDetector, path: Path | None = None) -> Path:
 
 
 def load_baselines(detector: ThreatDetector, path: Path | None = None) -> bool:
-    path = Path(path or BASELINE_PATH)
+    path = _ensure_under_data(Path(path or BASELINE_PATH))
     if not path.exists():
         return False
     try:
@@ -66,7 +79,7 @@ def load_baselines(detector: ThreatDetector, path: Path | None = None) -> bool:
 def save_models(detector: ThreatDetector, path: Path | None = None) -> Path | None:
     if not detector._sklearn_available:
         return None
-    path = Path(path or MODEL_PATH)
+    path = _ensure_under_data(Path(path or MODEL_PATH))
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         import joblib
@@ -107,7 +120,7 @@ def save_models(detector: ThreatDetector, path: Path | None = None) -> Path | No
 def load_models(detector: ThreatDetector, path: Path | None = None) -> bool:
     if not detector._sklearn_available:
         return False
-    path = Path(path or MODEL_PATH)
+    path = _ensure_under_data(Path(path or MODEL_PATH))
     if not path.exists():
         return False
     try:
