@@ -8,12 +8,14 @@ import time
 from typing import Any
 
 from .config import (
+    WEBHOOK_ALLOW_PRIVATE,
     WEBHOOK_FORMAT,
     WEBHOOK_MIN_SEVERITY,
     WEBHOOK_MIN_VOTES,
     WEBHOOK_TIMEOUT,
     WEBHOOK_URL,
 )
+from .security import is_safe_webhook_url
 
 logger = logging.getLogger("eagle-core.webhook")
 
@@ -151,6 +153,9 @@ def format_body(payload: dict[str, Any], fmt: str | None = None) -> dict[str, An
 def send_webhook_sync(payload: dict[str, Any]) -> dict[str, Any]:
     if not WEBHOOK_URL:
         return {"ok": False, "reason": "disabled"}
+    if not WEBHOOK_ALLOW_PRIVATE and not is_safe_webhook_url(WEBHOOK_URL):
+        logger.warning("Webhook URL blocked by SSRF guard")
+        return {"ok": False, "reason": "ssrf_blocked"}
     try:
         import urllib.request
 
@@ -162,7 +167,7 @@ def send_webhook_sync(payload: dict[str, Any]) -> dict[str, Any]:
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "EAGLE-X-Core/1.2",
+                "User-Agent": "EAGLE-X-Core/1.3",
             },
             method="POST",
         )

@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -20,6 +20,7 @@ from .config import (
     LIVE_MONITOR,
     LOG_DIR,
     LOG_LEVEL,
+    PROTECT_READ_APIS,
     SEAL,
     STATE_SAVE_EVERY,
     VERSION,
@@ -31,6 +32,15 @@ from .detector import ThreatDetector
 from .health import run_checks
 from .monitor import HostMonitor
 from .persist import load_all, save_all
+from .security import (
+    SecurityHeadersMiddleware,
+    assert_runtime_token_policy,
+    client_ip,
+    cors_origin_list,
+    rate_limiter,
+    require_token,
+    token_is_weak,
+)
 from .webhook import build_payload, send_webhook_sync, should_notify
 
 LOG_FILE = LOG_DIR / "eagle-core.log"
@@ -69,10 +79,7 @@ async def _fire_webhook(analysis: dict, threat_id: int, source: str) -> None:
 
 async def live_loop() -> None:
     global scans
-    logger.info(
-        "Live monitor started (ensemble + webhook=%s)",
-        bool(WEBHOOK_URL),
-    )
+    logger.info("Live monitor started (ensemble + webhook=%s)", bool(WEBHOOK_URL))
     try:
         async for snap in monitor.stream():
             if not _running:
@@ -127,6 +134,11 @@ async def live_loop() -> None:
 async def lifespan(app: FastAPI):
     global _task, _running
     _running = True
+    assert_runtime_token_policy()
+    if token_is_weak(API_TOKEN):
+        logger.warning(
+            "Weak/default EAGLE_API_TOKEN in use — set a strong secret before production"
+        )
     restored = load_all(detector)
     store.add_audit(
         "startup",
@@ -155,29 +167,46 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="EAGLE-X Core",
-    description=(
-        "Host security monitor — multi-model ensemble + webhooks + persistent state"
-    ),
+    description="Host security monitor — multi-model ensemble + hardened API",
     version=VERSION,
     lifespan=lifespan,
 )
+
+_origins = cors_origin_list()
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_origins,
+    allow_credentials=_origins != ["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
-def require_token(authorization: Optional[str] = Header(default=None)):
-    if not API_TOKEN:
-        return True
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    if authorization.split(" ", 1)[1].strip() != API_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    return True
+@app.middleware("http")
+async def rate_limit_sensitive(request: Request, call_next):
+    path = request.url.path
+    if (
+        path.startswith("/api/")
+        and path not in ("/api/health", "/api/ready", "/api/health/deep")
+        and request.method not in ("GET", "HEAD", "OPTIONS")
+    ):
+        try:
+            rate_limiter.check(client_ip(request))
+        except Exception as exc:
+            if hasattr(exc, "status_code"):
+                return JSONResponse(
+                    {"detail": getattr(exc, "detail", "error")},
+                    status_code=exc.status_code,
+                )
+            raise
+    return await call_next(request)
+
+
+def _guard_read(request: Request) -> None:
+    if PROTECT_READ_APIS:
+        require_token(request.headers.get("authorization"))
+        rate_limiter.check(client_ip(request))
 
 
 class DetectBody(BaseModel):
@@ -214,6 +243,8 @@ async def health():
         "scans": scans,
         "webhooks_sent": _webhooks_sent,
         "webhook_configured": bool(WEBHOOK_URL),
+        "auth_token_weak": token_is_weak(API_TOKEN),
+        "protect_read_apis": PROTECT_READ_APIS,
         "sklearn_available": detector._sklearn_available,
         "models": {
             "iforest": detector._iforest_trained,
@@ -256,7 +287,8 @@ async def health_deep():
 
 
 @app.get("/api/status")
-async def status():
+async def status(request: Request):
+    _guard_read(request)
     return {
         "version": VERSION,
         "seal": SEAL,
@@ -272,13 +304,15 @@ async def status():
 
 
 @app.get("/api/stats")
-async def stats():
+async def stats(request: Request):
+    _guard_read(request)
     snap = await asyncio.to_thread(monitor.snapshot)
     return {"scans": scans, "threats": store.count_threats(), "host": snap}
 
 
 @app.get("/api/threats")
-async def threats():
+async def threats(request: Request):
+    _guard_read(request)
     rows = store.list_threats(50)
     return {
         "threats": [
@@ -296,7 +330,8 @@ async def threats():
 
 
 @app.get("/api/detector/baseline")
-async def detector_baseline():
+async def detector_baseline(request: Request):
+    _guard_read(request)
     return detector.baseline_snapshot()
 
 
