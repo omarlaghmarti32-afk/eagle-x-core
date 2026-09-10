@@ -2,7 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN useradd -m -u 1000 eagle && mkdir -p /app/data /app/logs && chown -R eagle:eagle /app
+RUN useradd -m -u 1000 eagle \
+    && mkdir -p /app/data /app/logs \
+    && chown -R eagle:eagle /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -15,7 +17,8 @@ USER eagle
 ENV EAGLE_DATA_DIR=/app/data \
     EAGLE_LOG_DIR=/app/logs \
     EAGLE_LIVE_MONITOR=1 \
-    EAGLE_API_TOKEN=eagle-dev-token-change-me
+    EAGLE_REQUIRE_STRONG_TOKEN=1 \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 

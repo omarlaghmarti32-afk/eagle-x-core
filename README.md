@@ -2,7 +2,7 @@
 
 نظام مراقبة أمنية تشغيلية — تجميع 12 طبقة + Webhooks (Slack/Discord) + حفظ الحالة + لوحة تحكم حيّة.
 
-**https://github.com/omarlaghmarti32-afk/eagle-x-core** · **v1.2.0**
+**https://github.com/omarlaghmarti32-afk/eagle-x-core** · **v1.3.0**
 
 ## Features
 
@@ -61,3 +61,16 @@ EAGLE_LIVE_MONITOR=0 pytest -q
 ## License
 
 MIT
+
+
+## Security (v1.3)
+
+- Constant-time Bearer compare (`secrets.compare_digest`)
+- Optional strong-token enforcement: `EAGLE_REQUIRE_STRONG_TOKEN=1`
+- Configurable CORS: `EAGLE_CORS_ORIGINS`
+- Security headers (CSP, X-Frame-Options, nosniff, HSTS on HTTPS)
+- Rate limiting on mutating `/api/*` routes
+- Webhook SSRF guard (blocks localhost / private / cloud metadata IPs)
+- Path hardening for model/baseline files under `DATA_DIR`
+- Docker: no baked-in API token; `no-new-privileges`; non-root user
+- Optional read-API lock: `EAGLE_PROTECT_READ_APIS=1`
