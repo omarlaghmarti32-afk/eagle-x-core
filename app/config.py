@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 SEAL = "EAGLE-CORE-1.3"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
